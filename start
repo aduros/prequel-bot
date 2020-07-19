@@ -1,0 +1,209 @@
+#!/usr/bin/env node
+
+var MatroskaSubtitles = require("matroska-subtitles");
+var Promise = require("bluebird");
+var fs = require("fs");
+var path = require("path");
+var srt = require("subtitle");
+var tmp = require("tmp");
+var twitter = require("twitter");
+var util = require("util");
+
+var MINUTES_BETWEEN_TWEETS = 2*60;
+// var MINUTES_BETWEEN_TWEETS = 2;
+
+var secrets = JSON.parse(fs.readFileSync("secrets.json", "utf8"));
+var client = new twitter({
+    consumer_key: secrets.consumer_key,
+    consumer_secret: secrets.consumer_secret,
+    access_token_key: secrets.access_token_key,
+    access_token_secret: secrets.access_token_secret,
+});
+Promise.promisifyAll(client);
+
+var execFile = util.promisify(require("child_process").execFile);
+
+function ffmpeg (params) {
+    return execFile(require("ffmpeg-static"), params);
+}
+
+function loadSubtitles (videoFile, subsFile) {
+    if (subsFile == null) {
+        subsFile = videoFile;
+    }
+
+    switch (path.extname(subsFile)) {
+    case ".mkv":
+        var subtitles = [];
+        var mkvParser = new MatroskaSubtitles();
+        var firstTrack = 0;
+        mkvParser.once("tracks", function (tracks) {
+            firstTrack = tracks[0].number;
+        });
+        mkvParser.on("subtitle", function (subtitle, trackNumber) {
+            if (trackNumber == firstTrack) {
+                subtitles.push({
+                    start: subtitle.time/1000,
+                    duration: subtitle.duration/1000,
+                    text: subtitle.text,
+                    videoFile,
+                    subsFile,
+                });
+            }
+        });
+        return new Promise((resolve, reject) => {
+            fs.createReadStream(subsFile).pipe(mkvParser).on("finish", () => resolve(subtitles));
+        });
+
+    case ".srt":
+        var subtitles = [];
+        for (var item of srt.parse(fs.readFileSync(subsFile, "utf8"))) {
+            subtitles.push({
+                start: item.start/1000,
+                duration: (item.end-item.start)/1000,
+                text: item.text,
+                videoFile,
+                subsFile,
+            });
+        }
+        return Promise.resolve(subtitles);
+
+    default:
+        return Promise.reject(new Error("Unsupported subtitle format"));
+    }
+}
+
+async function renderClip (subtitle) {
+    var videoFile = subtitle.videoFile;
+    var subsFile = subtitle.subsFile;
+
+    var outFile = tmp.fileSync({prefix: "prequel-screens-", postfix: ".mp4"});
+    console.log("Rendering: \""+subtitle.text+"\"");
+    await ffmpeg([
+        "-copyts",
+        "-ss", subtitle.start, "-t", subtitle.duration,
+        "-i", videoFile,
+        "-vf", [
+            "crop=ih/9*16:ih",
+            "scale=1280:720",
+            "subtitles="+subsFile+":force_style='FontSize=24,PrimaryColour=&H1fe8ff&'",
+            "setpts=PTS-STARTPTS",
+            // "asetpts=N/SR/TB",
+        ].join(","),
+        "-an",
+        "-sn", "-dn", "-map_metadata", "-1",
+        "-y", outFile.name,
+    ]);
+    return outFile;
+}
+
+async function uploadVideo (buffer) {
+    console.log("INIT");
+    var init = await client.postAsync("media/upload", {
+        command: "INIT",
+        total_bytes: buffer.length,
+        media_type: "video/mp4",
+        media_category: "tweet_video",
+        // media_type: "image/gif",
+        // media_category: "tweet_gif",
+    });
+
+    var mediaId = init.media_id_string;
+    console.log(init);
+    console.log(buffer.length);
+
+    console.log("APPEND");
+    var append = await client.postAsync("media/upload", {
+        command: "APPEND",
+        media_id: mediaId,
+        // media: buffer,
+        media_data: buffer.toString("base64"),
+        segment_index: 0,
+    });
+    console.log(append);
+
+    console.log("FINALIZE");
+    var finalize = await client.postAsync("media/upload", {
+        command: "FINALIZE",
+        media_id: mediaId,
+    });
+    console.log(finalize);
+
+    var media = finalize;
+    while (media.processing_info != null && media.processing_info.state != "succeeded") {
+        console.log(media);
+        if (media.processing_info.state == "failed") {
+            throw new Error("Video upload failed");
+        }
+        await sleep(media.processing_info.check_after_secs*1000);
+        console.log("Rechecking status");
+        media = await client.getAsync("media/upload", {
+            command: "STATUS",
+            media_id: media.media_id_string,
+        });
+        console.log(media);
+    }
+
+    // var status = await client.getAsync("media/upload", {
+    //     command: "STATUS",
+    //     media_id: mediaId,
+    // });
+
+    return media;
+}
+
+function sleep (millis) {
+    return new Promise((resolve, reject) => {
+        setTimeout(resolve, millis);
+    });
+}
+
+async function tweet (file) {
+    // console.log("Reading "+file);
+    var buffer = fs.readFileSync(file);
+
+    var media = await uploadVideo(buffer);
+    // console.log(mediaId);
+    // console.log("Updating status");
+
+    // var media = await client.postMediaChunkedAsync({file_path: file});
+    // while (media.processing_info != null && media.processing_info.state != "succeeded") {
+    //     console.log(media);
+    //     if (media.processing_info.state == "failed") {
+    //         throw new Error("Video upload failed");
+    //     }
+    //     await sleep(media.processing_info.check_after_secs*1000);
+    //     console.log("Rechecking status");
+    //     var test = await client.getAsync("media/upload", {
+    //         command: "STATUS",
+    //         media_id: media.media_id_string,
+    //     });
+    //     console.log(test);
+    // }
+
+    await client.postAsync("statuses/update", {
+        media_ids: media.media_id_string,
+    });
+}
+
+(async function main () {
+	var videosDir = "/home/bruno/apps/prequel-videos/";
+    var subtitles = [].concat(
+        await loadSubtitles(videosDir+'Star.Wars.Episode.1.The.Phantom.Menace.1999.1080p.BrRip.x264.BOKUTOX.YIFY.mp4', videosDir+'Star.Wars.Episode.1.The.Phantom.Menace.1999.1080p.BrRip.x264.BOKUTOX.YIFY.srt'),
+        await loadSubtitles(videosDir+'Star.Wars.Episode.2.Attack.of.the.Clones.2002.1080p.BrRip.x264.BOKUTOX.YIFY.mp4', videosDir+'Star.Wars.Episode.2.Attack.of.the.Clones.2002.1080p.BrRip.x264.BOKUTOX.YIFY.srt'),
+        await loadSubtitles(videosDir+'Star.Wars.Episode.3.Revenge.of.the.Sith.2005.1080p.BrRip.x264.BOKUTOX.YIFY.mp4', videosDir+'Star.Wars.Episode.3.Revenge.of.the.Sith.2005.1080p.BrRip.x264.BOKUTOX.YIFY.srt'),
+    );
+
+    console.log("Total subtitle count: "+subtitles.length);
+
+    while (true) {
+        var idx = Math.floor(Math.random()*subtitles.length);
+        var tmpFile = await renderClip(subtitles[idx]);
+        console.log(tmpFile.name);
+
+        await tweet(tmpFile.name);
+        tmpFile.removeCallback();
+
+        await sleep(MINUTES_BETWEEN_TWEETS*60*1000);
+    }
+})();

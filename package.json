@@ -1,0 +1,19 @@
+{
+  "name": "prequel-bot",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "bluebird": "^3.7.2",
+    "ffmpeg-static": "^3.0.0",
+    "matroska-subtitles": "^2.0.3",
+    "subtitle": "^2.0.3",
+    "tmp": "^0.1.0",
+    "twitter": "^1.7.1"
+  }
+}
